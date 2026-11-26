@@ -181,11 +181,17 @@ jobs:
           python3 - <<'PY'
           import os
           rc = os.path.join(os.environ["FOX_DIR"], "device/lenovo/TB331FC/recovery/root/init.recovery.qcom.rc")
-          txt = open(rc, encoding="utf-8", errors="replace").read()
-          hx, nvt = txt.find("hxchipset.ko"), txt.find("nvt36523_spi.ko")
-          print("    hxchipset@%d nvt@%d" % (hx, nvt))
-          assert hx > 0 and nvt > 0 and hx < nvt, "!! insmod 顺序不对：hxchipset 必须在 nvt 之前"
-          print("    OK: hxchipset 在 nvt 之前")
+          # 只看真正生效的 insmod 行（别被注释里的文件名骗了：第一次失败就是踩了这个坑）
+          lines = [l.strip() for l in open(rc, encoding="utf-8", errors="replace").read().splitlines()
+                   if l.strip().startswith("insmod ")]
+          print("    insmod 行:%s" % lines)
+          assert any("hxchipset.ko" in l for l in lines), "缺 insmod hxchipset.ko"
+          assert any("nvt36523_spi.ko" in l for l in lines), "缺 insmod nvt36523_spi.ko"
+          hxi = next(i for i, l in enumerate(lines) if "hxchipset.ko" in l)
+          nvti = next(i for i, l in enumerate(lines) if "nvt36523_spi.ko" in l)
+          print("    hxchipset@insmod#%d  nvt@insmod#%d" % (hxi, nvti))
+          assert hxi < nvti, "insmod 顺序不对：hxchipset 必须在 nvt 之前"
+          print("    OK: insmod hxchipset 在 nvt 之前")
           PY
 
           echo "--- #2 中文界面：TW_EXTRA_LANGUAGES（两处必须同值）---"
