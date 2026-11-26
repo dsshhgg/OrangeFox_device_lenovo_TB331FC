@@ -254,6 +254,7 @@ jobs:
           df -h / | tee /tmp/df_before.txt
 
           (
+            set +e          # ★ 关键：envsetup.sh 里最后的 test 会返回 1，父 shell 带 -e 会把子 shell 直接打死
             set -x
             source build/envsetup.sh
             echo "==== envsetup done ===="
@@ -272,14 +273,14 @@ jobs:
           MAXMIN=320
           for i in $(seq 1 $MAXMIN); do
             if ! kill -0 $BPID 2>/dev/null; then
-              wait $BPID; RC=$?
+              RC=0; wait $BPID || RC=$?      # wait 在 set -e 下会直接中止脚本，必须 || 兜住
               echo "---- 构建结束（退出码 $RC，约 ${i} 分钟）----"
               tail -n 120 /tmp/build.log
               exit 0     # 成败交给后面的"定位产物"步骤判定
             fi
             if [ $((i % 15)) -eq 0 ]; then
               echo "---- 已运行 ${i} 分钟 ----"; df -h / | tail -1
-              tail -n 3 /tmp/build.log || true
+              tail -n 6 /tmp/build.log || true
             fi
             sleep 60
           done
