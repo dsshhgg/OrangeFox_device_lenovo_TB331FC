@@ -239,6 +239,31 @@ jobs:
           find "$FOX_DIR" -maxdepth 8 \( -name zh_CN.xml -o -name DroidSansFallback.ttf \) 2>/dev/null | head
 
       # ---------------------------------------------------------------------
+      # 6.5 打补丁：OrangeFox R12.1 源码自身的两个小毛病（不属于设备树，属上游）
+      #     —— run 45760876129 在 83%（29:59）崩在：
+      #        bootable/recovery/partitionmanager.cpp:1361: use of undeclared identifier 'AID_MEDIA_RW'
+      #        AID_MEDIA_RW 就是 media_rw 的 UID = 1023，直接换算成数字，不依赖任何头文件路径。
+      # ---------------------------------------------------------------------
+      - name: Patch known OrangeFox R12.1 source quirks
+        run: |
+          set -e
+          F="$FOX_DIR/bootable/recovery/partitionmanager.cpp"
+          echo "--- before ---"; grep -n "AID_MEDIA_RW" "$F" || true
+          python3 - <<'PY'
+          import os
+          f = os.path.join(os.environ["FOX_DIR"], "bootable/recovery/partitionmanager.cpp")
+          s = open(f, encoding="utf-8", errors="replace").read()
+          n = s.count("AID_MEDIA_RW")
+          s = s.replace("AID_MEDIA_RW", "1023")
+          open(f, "w", encoding="utf-8").write(s)
+          print("AID_MEDIA_RW -> 1023：替换 %d 处（media_rw 的 UID 就是 1023）" % n)
+          assert n > 0
+          PY
+          echo "--- after ---"; grep -n "AID_MEDIA_RW" "$F" || echo "(clean)"
+          # 顺手把 OF 里其它裸用 AID_MEDIA_RW 的文件也扫一遍（有就一起换算）
+          grep -rl "AID_MEDIA_RW" "$FOX_DIR/bootable/recovery" 2>/dev/null || echo "(no other file)"
+
+      # ---------------------------------------------------------------------
       # 7. 编译（后台跑 + 看门狗：保证 6h 硬墙内一定拿到"部分日志 + 可能的半成品"）
       # ---------------------------------------------------------------------
       - name: Build OrangeFox (background + watchdog)
@@ -263,9 +288,21 @@ jobs:
               lunch fox_${DEVICE_NAME}-ap2a-eng || \
               lunch fox_${DEVICE_NAME}-eng-ap3a || true
             get_build_var TARGET_PRODUCT
-            echo "==== mka ===="
-            mka adbd recoveryimage -j"${{ inputs.jobs }}"
-            echo "==== mka rc=$? ===="
+            # ---- 编译 + 自动修源码小毛病后增量重试（ninja 增量，第二次只要几十秒）----
+            MAXTRY=6
+            for t in $(seq 1 $MAXTRY); do
+              echo "==== mka attempt $t/$MAXTRY ===="
+              mka adbd recoveryimage -j"${{ inputs.jobs }}"
+              RC=$?
+              echo "==== mka rc=$RC ===="
+              if [ "$RC" -eq 0 ]; then break; fi
+              if python3 "${{ github.workspace }}/devicetree/ci/autofix-of-source.py" /tmp/build.log "$FOX_DIR"; then
+                echo "==== 已自动打补丁，增量重试 ===="
+                continue
+              fi
+              echo "==== 无可自动修复项，放弃 ===="
+              break
+            done
           ) > /tmp/build.log 2>&1 &
           BPID=$!
           echo "build pid=$BPID"
