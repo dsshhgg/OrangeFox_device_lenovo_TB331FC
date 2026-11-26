@@ -1,0 +1,1 @@
+dummy kernel placeholder (excluded from v4 recovery image via BOARD_EXCLUDE_KERNEL_FROM_RECOVERY_IMAGE)

@@ -1,0 +1,83 @@
+# TWRP init.recovery.qcom.rc for Lenovo TB331FC (SM6225-AD / bengal)
+
+import /init.recovery.qcom_decrypt.rc
+
+on init
+    write /sys/class/backlight/bkl-bl/brightness 1800
+    setprop sys.usb.configfs 1
+    setprop prepdecrypt.loglevel 2
+    setprop vendor.gatekeeper.is_security_level_spu 0
+    symlink /vendor/etc/vintf/manifest.xml /vendor/manifest.xml
+    symlink /system/etc/vintf/manifest.xml /system/manifest.xml
+
+on property:ro.boot.usbcontroller=*
+    setprop sys.usb.controller ${ro.boot.usbcontroller}
+    wait /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-4e00000.ssusb}/mode 2
+    write /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-4e00000.ssusb}/mode peripheral
+    wait /sys/class/udc/${ro.boot.usbcontroller} 2
+
+on fs
+    wait /dev/block/platform/soc/${ro.boot.bootdevice}
+    symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
+    chmod 0660 /dev/qseecom
+    chown system drmrpc /dev/qseecom
+    chmod 0664 /dev/ion
+    chown system system /dev/ion
+    mkdir /vendor/firmware_mnt 0771 system system
+    mount vfat /dev/block/bootdevice/by-name/modem${ro.boot.slot_suffix} /vendor/firmware_mnt ro shortname=lower,uid=1000,gid=1000,dmask=227,fmask=337
+    install_keyring
+
+on boot
+    # ---- 触摸：先 Himax，再 Novatek（顺序不能反）--------------------------------
+    # 【实机判定】真机触摸是 Himax HX83102J（himax-touchscreen）。nvt36523_spi.ko 在真机上
+    #   打印 "unknown panel, exit" 后退出，所以只加载它是点不动的。
+    #   补上 hxchipset.ko 之后：himax-touchscreen 注册成功、irqnum=209、触摸可用，
+    #   固件由内核按名请求 /lib/firmware/Himax_firmware.bin（另附 _hx83102j 别名一份）。
+    #   两个驱动都 insmod 是**故意**的：nvt 失败只是一行 dmesg，hx 才是真正生效的那个。
+    insmod /vendor/lib/modules/hxchipset.ko
+    # Load Novatek NT36523N touchscreen driver (firmware in /lib/firmware/novatek_ts_fw.bin)
+    insmod /vendor/lib/modules/nvt36523_spi.ko
+    write /sys/class/backlight/bkl-bl/brightness 1800
+    setprop crypto.ready 1
+
+on property:crypto.ready=1
+    start vendor.qseecomd
+
+on property:vendor.sys.listeners.registered=true
+    start qseecom-service
+    start vendor.keymint-qti
+    start gatekeeper-1-0
+
+on property:twrp.decrypt.done=true
+    stop gatekeeper-1-0
+    stop vendor.keymint-qti
+    stop qseecom-service
+    stop vendor.qseecomd
+
+service vendor.qseecomd /vendor/bin/qseecomd
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib64/hw:/system/lib64:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+service qseecom-service /vendor/bin/hw/vendor.qti.hardware.qseecom@1.0-service
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib64/hw:/system/lib64:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+service vendor.keymint-qti /vendor/bin/hw/android.hardware.security.keymint-service-qti
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib64/hw:/system/lib64:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+service gatekeeper-1-0 /vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib64/hw:/system/lib64:/sbin
+    disabled
+    seclabel u:r:recovery:s0

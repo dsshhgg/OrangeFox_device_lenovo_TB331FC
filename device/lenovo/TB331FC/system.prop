@@ -1,0 +1,19 @@
+# OrangeFox system.prop — Lenovo TB331FC
+# 只放 recovery 侧需要的属性；系统属性完全沿用基线（基线没有 system.prop，这一份是 OF 侧新增）
+# TARGET_SYSTEM_PROP 在 BoardConfig.mk 里被引用时才生效（fox_12.1 的常见写法）。
+
+# ADB / 调试（recovery 里 adbd 不是 secure 的；这是 OF 兄弟树的惯例）
+ro.adb.secure=0
+
+# 平台
+ro.board.platform=bengal
+
+# 动态分区
+ro.boot.dynamic_partitions=true
+
+# Gatekeeper / 加密（与树内 keymaster@4.1 + gatekeeper@1.0 blobs 对齐）
+fbe.metadata.wrappedkey=true
+vendor.gatekeeper.disable_spu=true
+
+# 充电时允许 suspend（OF 的充电界面依赖；兄弟树同款）
+ro.charger.enable_suspend=1

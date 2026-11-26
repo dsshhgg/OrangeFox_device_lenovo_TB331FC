@@ -1,0 +1,346 @@
+name: Build OrangeFox R12.1 for TB331FC
+
+# TB331FC / khaje / SM6225-AD —— OrangeFox (fox_12.1) 云编译
+#
+# 相对旧 CI（work/port_tools/TB331FC-OrangeFox/.github/workflows/build-fox.yml）的实质改动，
+# 每条都对应一条已实测的判据：
+#
+#  1) 内核：**不再**下载 46 MB 真内核。设备树 prebuilt/kernel 是 105 B 占位符 +
+#     BOARD_EXCLUDE_KERNEL_FROM_RECOVERY_IMAGE := true ⇒ 产物 kernel_size=0，与原厂一致。
+#  2) cmdline：OF/TWRP builder 会塞 buildvariant=eng，Lenovo ABL 对非空 cmdline 有缺陷
+#     ⇒ ci/fox-postprocess.py 强制清零并回读打印。
+#  3) 产物形态：**不加 AVB footer**，直接补零到 104,857,600 B —— 与真机实测能启动、
+#     且 himax 触摸注册成功的 recovery_hx_fw.img 同形（sha256 76b85251…）。
+#     该脚本已在那个镜像上做过一次"拆包→重拼"回归：输出 sha256 与原文件逐字节相同。
+#  4) 预算闸门：ramdisk_size ≤ 31,707,004 B（ABL **单项**上限，K=KSU 0x29C0000 口径）。
+#     **不要**再减 vendor/init_boot —— 那是总量口径；单项口径已被 21,618,637 B 实测证明宽松。
+#
+# 设备树内已带的四项修复（详见 device/lenovo/TB331FC/README.md）：
+#   #1 触摸 hxchipset.ko + Himax_firmware.bin + rc 里先 hx 后 nvt
+#   #2 中文界面 TW_EXTRA_LANGUAGES := true + zh_CN.xml
+#   #3 CJK 字体 DroidSansFallback.ttf（zh_CN.xml 的 fontoverride 指名要它）
+#   #4 上面的 ramdisk 预算断言（ci/fox-postprocess.py + ci/verify-recovery.py）
+
+on:
+  workflow_dispatch:
+    inputs:
+      of_branch:
+        description: 'OrangeFox 分支：sync_script 收 "12.1"（脚本自己拼 fox_12.1）；repo_init 两种都收'
+        required: true
+        default: '12.1'
+      sync_method:
+        description: 'sync_script（官方 orangefox_sync.sh，旧 CI 真跑通过）| repo_init'
+        required: true
+        default: 'sync_script'
+      slim:
+        description: '体积档 1=SLIM（关 crypto/fastbootd/MTP/lpdumpd/AromaFM）0=full'
+        required: true
+        default: '0'
+      max_ramdisk:
+        description: 'ramdisk_size 硬上限（字节）= ABL 单项预算 31707004'
+        required: true
+        default: '31707004'
+      jobs:
+        description: '并行度（标准 runner 通常 4 vCPU / 16 GB；填 4）'
+        required: true
+        default: '4'
+
+env:
+  DEVICE_NAME: TB331FC
+  FOX_DIR: /home/runner/fox
+  RAMDISK_LIMIT: '31707004'
+  IMG_TARGET_SIZE: '104857600'
+
+jobs:
+  build:
+    name: fox_12.1 · TB331FC
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. 设备树先 checkout（3.9 MB，先下来能提前 fail 掉路径问题）
+      # ---------------------------------------------------------------------
+      - name: Checkout device tree
+        uses: actions/checkout@v4
+        with:
+          path: devicetree
+
+      # ---------------------------------------------------------------------
+      # 2. 清盘：免费 runner 只有 ~84 GB，不清盘必挂
+      # ---------------------------------------------------------------------
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Report disk space
+        run: |
+          df -h /
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/lib/android 2>/dev/null || true
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 3. 依赖
+      # ---------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev \
+            libc6-dev-i386 libelf-dev libgl1-mesa-dev libssl-dev libx11-dev libncurses5 \
+            libncurses5-dev libsdl1.2-dev libwxgtk3.0-gtk3-dev lzop pngcrush python3 rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev unzip libxml2-utils \
+            openjdk-11-jdk lz4 cpio zstd aria2
+
+      - name: Install repo
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          git config --global user.name "TB331FC Fox Builder"
+          git config --global user.email "builder@tb331fc.local"
+          git config --global color.ui false
+          # 本地代理配置会污染 repo sync；runner 是干净出口
+          git config --global --unset http.proxy || true
+          git config --global --unset https.proxy || true
+          ~/bin/repo --version || true
+
+      # ---------------------------------------------------------------------
+      # 4. 同步源码：先按输入选择主路径，主路径没产出就自动换另一条
+      # ---------------------------------------------------------------------
+      - name: Sync OrangeFox source (primary + automatic fallback)
+        run: |
+          set +e
+          export PATH=$HOME/bin:$PATH
+          BR="${{ inputs.of_branch }}"
+          FOXBR="$BR"; case "$BR" in fox_*) ;; *) FOXBR="fox_$BR";; esac
+          echo "输入分支=$BR   repo 分支=$FOXBR   主路径=${{ inputs.sync_method }}"
+          mkdir -p "$FOX_DIR"
+
+          if [ "${{ inputs.sync_method }}" = "sync_script" ]; then
+            echo "==== 1) 官方 sync 脚本 ===="
+            git clone --depth=1 https://gitlab.com/OrangeFox/sync.git ~/of_sync
+            if [ -d ~/of_sync ]; then
+              cd ~/of_sync
+              chmod +x orangefox_sync.sh
+              ./orangefox_sync.sh --help || true
+              ./orangefox_sync.sh --branch "$BR" --path "$FOX_DIR"
+              echo "sync_script rc=$?"
+            fi
+          fi
+
+          if [ ! -d "$FOX_DIR/build" ]; then
+            echo "==== 2) 回退：repo init Manifest.git -b $FOXBR ===="
+            rm -rf "$FOX_DIR"; mkdir -p "$FOX_DIR"; cd "$FOX_DIR"
+            repo init --depth=1 -u https://gitlab.com/OrangeFox/Manifest.git -b "$FOXBR" || exit 1
+            repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags || exit 1
+          fi
+
+          test -d "$FOX_DIR/build" || { echo "::error::源码树同步失败（两条路径都没产出 $FOX_DIR/build）"; exit 1; }
+          echo "--- synced ---"; du -sh "$FOX_DIR" || true
+          df -h /
+
+      - name: Slim down synced tree (drop repo object stores)
+        run: |
+          set +e
+          cd "$FOX_DIR"
+          du -sh .repo 2>/dev/null
+          # 编译不需要 repo 的元数据；删掉可腾出 20-35%
+          rm -rf .repo/projects .repo/project-objects .repo/logs .repo/manifests* .repo/repo
+          du -sh .repo . 2>/dev/null
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 5. 装设备树 + 四项修复的构建前体检
+      # ---------------------------------------------------------------------
+      - name: Install device tree into source tree
+        run: |
+          set -e
+          DT="${{ github.workspace }}/devicetree/device/lenovo/${DEVICE_NAME}"
+          test -f "$DT/BoardConfig.mk" || { echo "::error::设备树路径不对：$DT"; ls -la "${{ github.workspace }}/devicetree"; exit 1; }
+          mkdir -p "$FOX_DIR/device/lenovo/${DEVICE_NAME}"
+          cp -r "$DT/." "$FOX_DIR/device/lenovo/${DEVICE_NAME}/"
+          chmod +x "$FOX_DIR/device/lenovo/${DEVICE_NAME}/vendorsetup.sh"
+          chmod +x "$FOX_DIR/device/lenovo/${DEVICE_NAME}/recovery/root/vendor/bin/qseecomd" \
+                   "$FOX_DIR/device/lenovo/${DEVICE_NAME}/recovery/root/vendor/bin/hw/"* 2>/dev/null || true
+
+          echo "===== 设备树体检（四项修复必须都在）====="
+          echo "--- #1 触摸：hxchipset.ko + Himax 固件 + rc 顺序 ---"
+          ls -l "$FOX_DIR/device/lenovo/${DEVICE_NAME}/recovery/root/vendor/lib/modules/" || true
+          ls -l "$FOX_DIR/device/lenovo/${DEVICE_NAME}/recovery/root/lib/firmware/" || true
+          grep -n "insmod" "$FOX_DIR/device/lenovo/${DEVICE_NAME}/recovery/root/init.recovery.qcom.rc"
+          python3 - <<'PY'
+          import os
+          rc = os.path.join(os.environ["FOX_DIR"], "device/lenovo/TB331FC/recovery/root/init.recovery.qcom.rc")
+          txt = open(rc, encoding="utf-8", errors="replace").read()
+          hx, nvt = txt.find("hxchipset.ko"), txt.find("nvt36523_spi.ko")
+          print("    hxchipset@%d nvt@%d" % (hx, nvt))
+          assert hx > 0 and nvt > 0 and hx < nvt, "!! insmod 顺序不对：hxchipset 必须在 nvt 之前"
+          print("    OK: hxchipset 在 nvt 之前")
+          PY
+
+          echo "--- #2 中文界面：TW_EXTRA_LANGUAGES（两处必须同值）---"
+          grep -rn "TW_EXTRA_LANGUAGES" "$FOX_DIR/device/lenovo/${DEVICE_NAME}/BoardConfig.mk" \
+                                          "$FOX_DIR/device/lenovo/${DEVICE_NAME}/of_size.mk"
+
+          echo "--- #3 CJK 字体 + zh_CN.xml（树内随带，作 bootstrap 兜底）---"
+          ls -l "$FOX_DIR/device/lenovo/${DEVICE_NAME}/prebuilt/fonts/" \
+                "$FOX_DIR/device/lenovo/${DEVICE_NAME}/prebuilt/languages/"
+
+          echo "--- prebuilt/kernel 必须是占位符（kernel_size=0）---"
+          wc -c "$FOX_DIR/device/lenovo/${DEVICE_NAME}/prebuilt/kernel"
+          test "$(wc -c < "$FOX_DIR/device/lenovo/${DEVICE_NAME}/prebuilt/kernel")" -lt 1024 || \
+            { echo "::error::prebuilt/kernel 不是占位符，产物 kernel_size 会不为 0"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # 6. 语言/字体 bootstrap：把 zh_CN.xml 与 DroidSansFallback.ttf 塞进源码主题目录
+      #    （哪个目录存在就塞哪个）——不依赖 recovery/root 覆盖顺序，两条机制各留一条后路
+      # ---------------------------------------------------------------------
+      - name: Bootstrap zh_CN language + CJK font into source theme dirs
+        run: |
+          set -e
+          DT="$FOX_DIR/device/lenovo/${DEVICE_NAME}"
+          LANG_SRC="$DT/prebuilt/languages/zh_CN.xml"
+          FONT_SRC="$DT/prebuilt/fonts/DroidSansFallback.ttf"
+          echo "--- 源码里的主题字体/语言目录（前 20）---"
+          find "$FOX_DIR" -maxdepth 7 -type d -path "*theme*" \( -name languages -o -name fonts \) \
+            2>/dev/null | head -20 || true
+          for d in \
+              "$FOX_DIR/bootable/recovery/gui/theme/common/languages" \
+              "$FOX_DIR/vendor/twrp/res/languages" \
+              "$FOX_DIR/vendor/twrp/languages" ; do
+            if [ -d "$d" ]; then cp -f "$LANG_SRC" "$d/zh_CN.xml"; echo "zh_CN.xml -> $d"; fi
+          done
+          for d in \
+              "$FOX_DIR/bootable/recovery/gui/theme/common/fonts" \
+              "$FOX_DIR/vendor/twrp/res/fonts" \
+              "$FOX_DIR/vendor/twrp/fonts" ; do
+            if [ -d "$d" ]; then
+              [ -f "$d/DroidSansFallback.ttf" ] || cp -f "$FONT_SRC" "$d/DroidSansFallback.ttf"
+              echo "font dir: $d"; ls -l "$d/DroidSansFallback.ttf" || true
+            fi
+          done
+          echo "--- 目录里现在有 ---"
+          find "$FOX_DIR" -maxdepth 8 \( -name zh_CN.xml -o -name DroidSansFallback.ttf \) 2>/dev/null | head
+
+      # ---------------------------------------------------------------------
+      # 7. 编译（后台跑 + 看门狗：保证 6h 硬墙内一定拿到"部分日志 + 可能的半成品"）
+      # ---------------------------------------------------------------------
+      - name: Build OrangeFox (background + watchdog)
+        shell: bash
+        run: |
+          cd "$FOX_DIR"
+          unset USE_CCACHE CCACHE_DIR CCACHE_EXEC     # runner 上 ccache 常见只读告警
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export FOX_USE_TWRP_RECOVERY_IMAGE_BUILDER=1
+          export LC_ALL=C
+          export OF_TB331FC_SLIM="${{ inputs.slim }}"
+          echo "OF_TB331FC_SLIM=$OF_TB331FC_SLIM"
+          df -h / | tee /tmp/df_before.txt
+
+          (
+            set -x
+            source build/envsetup.sh
+            echo "==== envsetup done ===="
+            lunch fox_${DEVICE_NAME}-eng || \
+              lunch fox_${DEVICE_NAME}-eng-ap2a || \
+              lunch fox_${DEVICE_NAME}-ap2a-eng || \
+              lunch fox_${DEVICE_NAME}-eng-ap3a || true
+            get_build_var TARGET_PRODUCT
+            echo "==== mka ===="
+            mka adbd recoveryimage -j"${{ inputs.jobs }}"
+            echo "==== mka rc=$? ===="
+          ) > /tmp/build.log 2>&1 &
+          BPID=$!
+          echo "build pid=$BPID"
+
+          MAXMIN=320
+          for i in $(seq 1 $MAXMIN); do
+            if ! kill -0 $BPID 2>/dev/null; then
+              wait $BPID; RC=$?
+              echo "---- 构建结束（退出码 $RC，约 ${i} 分钟）----"
+              tail -n 120 /tmp/build.log
+              exit 0     # 成败交给后面的"定位产物"步骤判定
+            fi
+            if [ $((i % 15)) -eq 0 ]; then
+              echo "---- 已运行 ${i} 分钟 ----"; df -h / | tail -1
+              tail -n 3 /tmp/build.log || true
+            fi
+            sleep 60
+          done
+          echo "::error::看门狗超时（${MAXMIN} 分钟），杀掉构建并保留日志"
+          kill -TERM $BPID 2>/dev/null; sleep 10; kill -9 $BPID 2>/dev/null
+          tail -n 200 /tmp/build.log || true
+          exit 1
+
+      # ---------------------------------------------------------------------
+      # 8. 定位产物
+      # ---------------------------------------------------------------------
+      - name: Locate product image
+        id: locate
+        run: |
+          OUT="$FOX_DIR/out/target/product/${DEVICE_NAME}"
+          echo "==== $OUT ===="
+          ls -la "$OUT" 2>/dev/null | head -40 || true
+          IMG=""
+          for c in recovery.img OrangeFox-*.img; do
+            if [ -f "$OUT/$c" ]; then IMG="$OUT/$c"; break; fi
+          done
+          if [ -z "$IMG" ]; then
+            echo "::error::未找到 recovery 产物（编译没走完？看 fox-build-log 尾部 /tmp/build.log）"
+            exit 1
+          fi
+          echo "img=$IMG" >> $GITHUB_OUTPUT
+          echo "产物: $IMG ($(stat -c %s "$IMG") B)"
+
+      # ---------------------------------------------------------------------
+      # 9. 后处理 + 硬闸门（清 cmdline / 只取头+ramdisk / 内容体检 / 预算断言 / 补到 104,857,600）
+      # ---------------------------------------------------------------------
+      - name: Post-process and gate
+        run: |
+          set -o pipefail
+          IMG="${{ steps.locate.outputs.img }}"
+          OUTDIR="$FOX_DIR/out/target/product/${DEVICE_NAME}"
+          lz4 --version | head -1 || true
+          cpio --version | head -1 || true
+          python3 "${{ github.workspace }}/devicetree/ci/fox-postprocess.py" "$IMG" \
+            --outdir "$OUTDIR" \
+            --max-ramdisk "${{ inputs.max_ramdisk }}" \
+            --target-size "$IMG_TARGET_SIZE" 2>&1 | tee /tmp/postprocess.txt
+          test ${PIPESTATUS[0]} -eq 0
+
+      - name: Independent re-verify (second pair of eyes)
+        run: |
+          python3 "${{ github.workspace }}/devicetree/ci/verify-recovery.py" \
+            "$FOX_DIR/out/target/product/${DEVICE_NAME}/recovery_fox.img" \
+            --max-ramdisk "${{ inputs.max_ramdisk }}" \
+            --expect-size "$IMG_TARGET_SIZE" --inspect
+
+      # ---------------------------------------------------------------------
+      # 10. 产物上传（不管成败都传：失败时也要拿到日志与 listing）
+      # ---------------------------------------------------------------------
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-TB331FC-recovery
+          path: |
+            /home/runner/fox/out/target/product/TB331FC/recovery_fox.img
+            /home/runner/fox/out/target/product/TB331FC/recovery_fox_unpadded.img
+            /home/runner/fox/out/target/product/TB331FC/recovery.img
+            /home/runner/fox/out/target/product/TB331FC/OrangeFox-*.img
+            /tmp/build.log
+            /tmp/postprocess.txt
+            /tmp/ramdisk_listing.txt
+            /tmp/df_before.txt
+          if-no-files-found: warn
+          retention-days: 14

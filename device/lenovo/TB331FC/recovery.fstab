@@ -1,0 +1,23 @@
+# OrangeFox / TWRP-12.1 recovery fstab — Lenovo TB331FC (khaje)
+#
+# ★ 内容逐字节沿用 TWRP 基线（已能开机的那一份）。没改成 GUIDE 里推荐的 `_a` 变体，原因：
+#   本机 super 里 7 个逻辑分区的 `*_b` extents 全是 0，`slotselect` 由 fs_mgr 按当前槽展开成
+#   `system_a` 还是 `system_b` 取决于 ro.boot.slot_suffix —— 基线在 a 槽上验证过能挂对，
+#   而 `_a` 变体只在 a 槽成立。两者不冲突：fstab 管 fs_mgr 首挂载，TWRP/OF 自己的
+#   分区菜单读的是 ramdisk 里的 system/etc/twrp.flags（同样在树内，原样照抄）。
+#   真机上若 Mount 菜单出现"挂不上/重复项"，第一件事是把下面 7 行换成 `_a` + 无 slotselect。
+#
+#<src>                                                 <mnt_point>            <type>  <mnt_flags and options>                            <fs_mgr_flags>
+system                                                  /system                ext4    ro,barrier=1,discard                                 wait,slotselect,logical,first_stage_mount
+system_ext                                              /system_ext            ext4    ro,barrier=1,discard                                 wait,slotselect,logical,first_stage_mount
+vendor                                                  /vendor                ext4    ro,barrier=1,discard                                 wait,slotselect,logical,first_stage_mount
+vendor_dlkm                                             /vendor_dlkm           ext4    ro,barrier=1,discard                                 wait,slotselect,logical,first_stage_mount
+system_dlkm                                             /system_dlkm           ext4    ro,barrier=1,discard                                 wait,slotselect,logical,first_stage_mount
+odm                                                     /odm                   ext4    ro,barrier=1,discard                                 wait,slotselect,logical,first_stage_mount
+product                                                 /product               ext4    ro,barrier=1,discard                                 wait,slotselect,logical,first_stage_mount
+
+# metadata 必须先于 /data（FBE v2 的 keydirectory 在 /metadata/vold/metadata_encryption）
+/dev/block/by-name/metadata                             /metadata              f2fs    noatime,nosuid,nodev,discard                         wait,check,formattable,first_stage_mount
+/dev/block/bootdevice/by-name/userdata                  /data                  f2fs    noatime,nosuid,nodev,discard,reserve_root=32768,resgid=1065,fsync_mode=nobarrier,inlinecrypt  latemount,wait,check,formattable,quota,reservedsize=128M,fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized+wrappedkey_v0,metadata_encryption=aes-256-xts:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption,checkpoint=fs
+/dev/block/bootdevice/by-name/persist                   /mnt/vendor/persist    ext4    noatime,nosuid,nodev,barrier=1                       wait
+/dev/block/bootdevice/by-name/misc                      /misc                  emmc    defaults                                             defaults
