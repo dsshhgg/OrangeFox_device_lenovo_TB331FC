@@ -1,0 +1,116 @@
+--- a/minuitwrp/events.cpp
++++ b/minuitwrp/events.cpp
+@@ -108,6 +108,16 @@
+     struct input_absinfo xi, yi;
+ };
+ 
++struct vk_touch_state {
++    int downX = -1, downY = -1;
++    int discard = 0;
++    int last_virt_key = 0;
++    int lastWasSynReport = 0;
++    int touchReleaseOnNextSynReport = 0;
++    int use_tracking_id_negative_as_touch_release = 0;
++    bool btn_touch_up = false;
++};
++
+ struct ev {
+     struct pollfd *fd;
+ 
+@@ -120,6 +130,7 @@
+ 
+     struct position p, mt_p;
+     int down;
++    vk_touch_state himax_touch;
+ };
+ 
+ static struct pollfd ev_fds[MAX_DEVICES];
+@@ -387,6 +398,7 @@
+             fd = openat(dirfd(dir), de->d_name, O_RDONLY);
+             if(fd < 0) continue;
+ 
++            evs[ev_count].himax_touch = {};
+ 			ev_fds[ev_count].fd = fd;
+             ev_fds[ev_count].events = POLLIN;
+             evs[ev_count].fd = &ev_fds[ev_count];
+@@ -473,12 +485,18 @@
+ /* Returns non-zero when the event should be consumed */
+ static int vk_modify(struct ev *e, struct input_event *ev)
+ {
+-    static int downX = -1, downY = -1;
+-    static int discard = 0;
+-    static int last_virt_key = 0;
+-    static int lastWasSynReport = 0;
+-    static int touchReleaseOnNextSynReport = 0;
+-	static int use_tracking_id_negative_as_touch_release = 0; // On some devices, type: 3  code: 39  value: -1, aka EV_ABS ABS_MT_TRACKING_ID -1 indicates a true touch release
++    // TB331FC Himax reports BTN_TOUCH for the entire contact set. Keep this
++    // node's state separate so an interleaved stylus SYN cannot consume its UP.
++    const bool himax = strcmp(e->deviceName, "himax-touchscreen") == 0;
++    static vk_touch_state legacy;
++    auto& state = himax ? e->himax_touch : legacy;
++    auto& downX = state.downX;
++    auto& downY = state.downY;
++    auto& discard = state.discard;
++    auto& last_virt_key = state.last_virt_key;
++    auto& lastWasSynReport = state.lastWasSynReport;
++    auto& touchReleaseOnNextSynReport = state.touchReleaseOnNextSynReport;
++    auto& use_tracking_id_negative_as_touch_release = state.use_tracking_id_negative_as_touch_release;
+     int i;
+     int x, y;
+ 
+@@ -501,6 +519,8 @@
+ 
+ 	// Handle keyboard events, value of 1 indicates key down, 0 indicates key up
+ 	if (ev->type == EV_KEY) {
++        if (himax && ev->code == BTN_TOUCH && ev->value <= 1)
++            state.btn_touch_up = ev->value == 0;
+ 		return 0;
+ 	}
+ 
+@@ -552,7 +572,7 @@
+             break;
+ 
+         case ABS_MT_TOUCH_MAJOR: //30
+-            if (ev->value == 0)
++            if (!himax && ev->value == 0)
+             {
+ #ifndef TW_IGNORE_MAJOR_AXIS_0
+                 // We're in a touch release, although some devices will still send positions as well
+@@ -567,7 +587,7 @@
+             break;
+ 
+ 		case ABS_MT_PRESSURE: //3a
+-                    if (ev->value == 0)
++            if (!himax && ev->value == 0)
+             {
+                 // We're in a touch release, although some devices will still send positions as well
+                 e->mt_p.x = 0;
+@@ -620,7 +640,7 @@
+ #endif
+             return 1;
+ #endif
+-            if (ev->value < 0) {
++            if (!himax && ev->value < 0) {
+                 e->mt_p.x = 0;
+                 e->mt_p.y = 0;
+                 touchReleaseOnNextSynReport = 2;
+@@ -691,8 +711,17 @@
+     // Discard the MT versions
+     if (ev->code == SYN_MT_REPORT)      return 0;
+ 
+-    if (((lastWasSynReport == 1 || touchReleaseOnNextSynReport == 1) && !use_tracking_id_negative_as_touch_release) || (use_tracking_id_negative_as_touch_release && touchReleaseOnNextSynReport == 2))
+-    {
++    const bool release = himax
++        ? (ev->type == EV_SYN && ev->code == SYN_REPORT && state.btn_touch_up)
++        : (((lastWasSynReport == 1 || touchReleaseOnNextSynReport == 1) && !use_tracking_id_negative_as_touch_release) || (use_tracking_id_negative_as_touch_release && touchReleaseOnNextSynReport == 2));
++    if (release)
++    {
++        if (himax) {
++            state.btn_touch_up = false;
++            e->p.synced = e->mt_p.synced = 0;
++            if (downX == -1)
++                return 1;
++        }
+         // Reset the value
+         touchReleaseOnNextSynReport = 0;
+ 

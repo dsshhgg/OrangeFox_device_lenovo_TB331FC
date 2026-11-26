@@ -35,7 +35,7 @@ on:
       slim:
         description: '体积档 1=SLIM（关 crypto/fastbootd/MTP/lpdumpd/AromaFM）0=full'
         required: true
-        default: '0'
+        default: '1'
       max_ramdisk:
         description: 'ramdisk_size 硬上限（字节）= ABL 单项预算 31707004'
         required: true
@@ -148,6 +148,9 @@ jobs:
           test -d "$FOX_DIR/build" || { echo "::error::源码树同步失败（两条路径都没产出 $FOX_DIR/build）"; exit 1; }
           echo "--- synced ---"; du -sh "$FOX_DIR" || true
           df -h /
+
+      - name: Apply and replay TB331FC Himax release patch
+        run: bash "$GITHUB_WORKSPACE/devicetree/ci/apply-himax.sh" "$FOX_DIR/bootable/recovery"
 
       - name: Slim down synced tree (drop repo object stores)
         run: |
